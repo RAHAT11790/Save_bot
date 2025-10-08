@@ -27,10 +27,10 @@ from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, Callb
 app = Flask(__name__)
 
 # Configuration from Environment Variables
-API_ID = int(os.environ.get('API_ID', '25976192'))
-API_HASH = os.environ.get('API_HASH', '8ba23141980539b4896e5adbc4ffd2e2'))
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '8061585389:AAFT-3cubiYTU9VjX9VVYDE8Q6hh6mJJc-s')
-OWNER_ID = int(os.environ.get('OWNER_ID', '6621572366'))
+API_ID = int(os.environ.get('API_ID', ''))
+API_HASH = os.environ.get('API_HASH', ''))
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
+OWNER_ID = int(os.environ.get('OWNER_ID', ''))
 SESSION_NAME = os.environ.get('SESSION_NAME', 'user')
 PORT = int(os.environ.get('PORT', 5000))
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB
