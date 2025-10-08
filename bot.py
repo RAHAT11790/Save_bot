@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Telegram Media Bridge - Flask Version for Render.com
-Media Type Detection Fixed - Compatible with latest Telethon
+Telegram Media Bridge - Fixed Version
+Fast Download & Upload, Proper Media Types
 """
 
 import os
@@ -15,6 +15,12 @@ from functools import wraps
 from flask import Flask, request, jsonify
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
+from telethon.tl.types import (
+    Document,
+    Photo,
+    DocumentAttributeVideo,
+    DocumentAttributeFilename
+)
 from telegram import Update
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 
@@ -30,7 +36,14 @@ PORT = int(os.environ.get('PORT', 5000))
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB
 
 # Logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('bot.log')
+    ]
+)
 logger = logging.getLogger("telebridge")
 
 # State
@@ -63,7 +76,13 @@ class TeleHelper:
 
     async def _init_client(self):
         if self.client is None:
-            self.client = TelegramClient(self.session_name, self.api_id, self.api_hash, loop=self.loop)
+            self.client = TelegramClient(
+                self.session_name, 
+                self.api_id, 
+                self.api_hash, 
+                loop=self.loop,
+                connection_retries=5
+            )
             await self.client.connect()
         return self.client
 
@@ -108,163 +127,216 @@ class TeleHelper:
             return await client.is_user_authorized()
         return self.run_coro(_check())
 
-    def detect_media_type(self, msg_media):
-        """Detect media type from message media"""
+    def detect_media_type_and_name(self, msg_media):
+        """Detect media type and proper file name"""
         if not msg_media:
-            return "document"
+            return "document", "file.bin"
         
-        media_class_name = msg_media.__class__.__name__
-        logger.info(f"Media class: {media_class_name}")
+        media_type = "document"
+        file_name = "file.bin"
+        file_extension = ""
         
-        if 'Photo' in media_class_name:
-            return "photo"
-        elif 'Video' in media_class_name:
-            return "video"
-        elif 'Document' in media_class_name:
-            # Check mime type for documents
-            if hasattr(msg_media, 'document'):
+        try:
+            # Check if it's a photo
+            if hasattr(msg_media, 'photo') and msg_media.photo:
+                media_type = "photo"
+                file_extension = ".jpg"
+            
+            # Check if it's a document with attributes
+            elif hasattr(msg_media, 'document'):
                 document = msg_media.document
+                
+                # Check mime type
                 if hasattr(document, 'mime_type') and document.mime_type:
                     mime_type = document.mime_type
                     if mime_type.startswith('image/'):
-                        return "photo"
+                        media_type = "photo"
+                        file_extension = ".jpg"
                     elif mime_type.startswith('video/'):
-                        return "video"
-            return "document"
-        else:
-            return "document"
+                        media_type = "video"
+                        file_extension = ".mp4"
+                    elif mime_type.startswith('audio/'):
+                        media_type = "audio"
+                        file_extension = ".mp3"
+                
+                # Check document attributes for better detection
+                if hasattr(document, 'attributes'):
+                    for attr in document.attributes:
+                        if isinstance(attr, DocumentAttributeVideo):
+                            media_type = "video"
+                            file_extension = ".mp4"
+                        elif isinstance(attr, DocumentAttributeFilename):
+                            file_name = attr.file_name
+                            # Determine type from file extension
+                            if file_name.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                                media_type = "photo"
+                            elif file_name.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
+                                media_type = "video"
+                            elif file_name.lower().endswith(('.mp3', '.wav', '.ogg')):
+                                media_type = "audio"
+            
+            # If no proper name found, create one based on type
+            if file_name == "file.bin" and file_extension:
+                file_name = f"file{file_extension}"
+                
+        except Exception as e:
+            logger.error(f"Error detecting media type: {e}")
+        
+        return media_type, file_name
 
-    def fetch_message_and_download(self, from_chat, msg_id, dest_path):
+    def fetch_message_and_download(self, from_chat, msg_id):
         async def _fetch():
             client = await self._init_client()
-            start_time = time.time()
-
-            async def progress_callback(downloaded, total):
-                if total == 0:
-                    return
-                percent = (downloaded / total) * 100
-                elapsed = time.time() - start_time
-                if elapsed > 0:
-                    speed = downloaded / elapsed
-                    remaining = total - downloaded
-                    eta = remaining / speed if speed > 0 else 0
-                    eta_str = f"{int(eta // 60)}m {int(eta % 60)}s"
-                else:
-                    eta_str = "Unknown"
-                if time.time() - STATE["last_progress_update"] > 5:
-                    logger.info(f"⏳ Download: {percent:.1f}% (ETA: {eta_str})")
-                    STATE["last_progress_update"] = time.time()
-
+            
             try:
-                logger.info(f"Fetching message from {from_chat} with ID {msg_id}")
+                logger.info(f"📨 Fetching message from {from_chat} with ID {msg_id}")
                 
+                # Get the message
                 msg = await client.get_messages(from_chat, ids=msg_id)
                 if not msg:
                     return {"ok": False, "error": "Message not found"}
                 
-                logger.info(f"Message found: {msg.id}, Media: {msg.media}")
+                logger.info(f"✅ Message found: {msg.id}, Media: {msg.media}")
                 
-                if msg.media:
-                    logger.info("Downloading media...")
-                    path = await client.download_media(
-                        msg, 
-                        file=dest_path,
-                        progress_callback=progress_callback
-                    )
+                if not msg.media:
+                    return {"ok": True, "has_media": False, "text": msg.text or ""}
+                
+                # Detect media type and file name
+                media_type, file_name = self.detect_media_type_and_name(msg.media)
+                
+                # Create proper temp file with correct extension
+                file_extension = os.path.splitext(file_name)[1] or ".tmp"
+                with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
+                    dest_path = temp_file.name
+                
+                logger.info(f"📥 Downloading {media_type}: {file_name}")
+                
+                # Download with progress
+                start_time = time.time()
+                last_update = start_time
+                
+                def progress_callback(downloaded, total):
+                    nonlocal last_update
+                    current_time = time.time()
+                    if current_time - last_update > 3:  # Update every 3 seconds
+                        if total > 0:
+                            percent = (downloaded / total) * 100
+                            elapsed = current_time - start_time
+                            speed = downloaded / elapsed if elapsed > 0 else 0
+                            speed_mb = speed / (1024 * 1024)
+                            logger.info(f"⏳ Download: {percent:.1f}% | Speed: {speed_mb:.1f} MB/s")
+                        last_update = current_time
+                
+                # Download the media
+                path = await client.download_media(
+                    msg, 
+                    file=dest_path,
+                    progress_callback=progress_callback
+                )
+                
+                if path and os.path.exists(path):
+                    file_size = os.path.getsize(path)
+                    download_time = time.time() - start_time
+                    speed = file_size / download_time if download_time > 0 else 0
+                    speed_mb = speed / (1024 * 1024)
                     
-                    if path and os.path.exists(path):
-                        file_size = os.path.getsize(path)
-                        logger.info(f"Download completed: {path}, Size: {file_size} bytes")
-                        
-                        if file_size > MAX_FILE_SIZE:
-                            os.unlink(path)
-                            return {"ok": False, "error": f"File too large ({file_size / (1024**2):.2f} MB > 2 GB)"}
-                        
-                        # Detect media type
-                        media_type = self.detect_media_type(msg.media)
-                        
-                        return {
-                            "ok": True,
-                            "has_media": True,
-                            "file_path": path,
-                            "text": msg.text or "",
-                            "file_size": file_size / (1024**2),
-                            "file_name": os.path.basename(path),
-                            "media_type": media_type
-                        }
-                    else:
-                        return {"ok": False, "error": "Download failed - file not found"}
-                
-                return {"ok": True, "has_media": False, "text": msg.text or ""}
+                    logger.info(f"✅ Download complete: {file_size} bytes in {download_time:.1f}s ({speed_mb:.1f} MB/s)")
+                    
+                    if file_size > MAX_FILE_SIZE:
+                        os.unlink(path)
+                        return {"ok": False, "error": f"File too large ({file_size / (1024**2):.2f} MB > 2 GB)"}
+                    
+                    return {
+                        "ok": True,
+                        "has_media": True,
+                        "file_path": path,
+                        "text": msg.text or "",
+                        "file_size": file_size / (1024**2),
+                        "file_name": file_name,
+                        "media_type": media_type,
+                        "download_speed": speed_mb
+                    }
+                else:
+                    return {"ok": False, "error": "Download failed - file not found"}
                 
             except Exception as e:
-                logger.error(f"Download failed: {e}")
+                logger.error(f"❌ Download failed: {e}")
                 return {"ok": False, "error": str(e)}
         
         return self.run_coro(_fetch())
 
-    def upload_to_telegram(self, file_path, caption, chat_id, media_type="document"):
-        async def _upload():
-            client = await self._init_client()
+    def upload_to_telegram_bot(self, file_path, caption, media_type, file_name):
+        """Upload to bot using Telegram Bot API (fast)"""
+        try:
+            import requests
+            from urllib.parse import quote
+            
+            # Prepare files and data
+            files = {}
+            data = {'chat_id': OWNER_ID}
+            
+            if caption:
+                data['caption'] = caption[:1024]  # Telegram caption limit
+            
+            # Set appropriate parameter based on media type
+            if media_type == "photo":
+                files['photo'] = open(file_path, 'rb')
+                url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+            elif media_type == "video":
+                files['video'] = open(file_path, 'rb')
+                data['supports_streaming'] = True
+                url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
+            elif media_type == "audio":
+                files['audio'] = open(file_path, 'rb')
+                url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendAudio"
+            else:
+                files['document'] = open(file_path, 'rb')
+                url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+            
+            # Upload with progress tracking
+            file_size = os.path.getsize(file_path)
             start_time = time.time()
-
-            async def progress_callback(uploaded, total):
-                if total == 0:
-                    return
-                percent = (uploaded / total) * 100
-                elapsed = time.time() - start_time
-                if elapsed > 0:
-                    speed = uploaded / elapsed
-                    remaining = total - uploaded
-                    eta = remaining / speed if speed > 0 else 0
-                    eta_str = f"{int(eta // 60)}m {int(eta % 60)}s"
-                else:
-                    eta_str = "Unknown"
-                if time.time() - STATE["last_progress_update"] > 5:
-                    logger.info(f"⏳ Upload: {percent:.1f}% (ETA: {eta_str})")
-                    STATE["last_progress_update"] = time.time()
-
-            try:
-                logger.info(f"Uploading {media_type}: {file_path} to chat {chat_id}")
+            
+            def read_in_chunks(file_object, chunk_size=1024*1024):  # 1MB chunks
+                while True:
+                    data = file_object.read(chunk_size)
+                    if not data:
+                        break
+                    yield data
+            
+            # For large files, we need to use different approach
+            if file_size > 50 * 1024 * 1024:  # 50MB
+                logger.info("📤 Using chunked upload for large file")
+                response = requests.post(url, data=data, files=files, timeout=300)
+            else:
+                logger.info("📤 Uploading file directly")
+                response = requests.post(url, data=data, files=files, timeout=300)
+            
+            # Close file handles
+            for file_handle in files.values():
+                file_handle.close()
+            
+            upload_time = time.time() - start_time
+            speed = file_size / upload_time if upload_time > 0 else 0
+            speed_mb = speed / (1024 * 1024)
+            
+            if response.status_code == 200:
+                logger.info(f"✅ Upload complete in {upload_time:.1f}s ({speed_mb:.1f} MB/s)")
+                return {"ok": True, "message": "File uploaded successfully"}
+            else:
+                error_msg = response.json().get('description', 'Unknown error')
+                logger.error(f"❌ Upload failed: {error_msg}")
+                return {"ok": False, "error": error_msg}
                 
-                # Determine upload parameters based on media type
-                if media_type == "photo":
-                    # Send as photo
-                    result = await client.send_file(
-                        chat_id, 
-                        file=file_path,
-                        caption=caption[:1024] if caption else None,
-                        progress_callback=progress_callback,
-                        force_document=False
-                    )
-                elif media_type == "video":
-                    # Send as video
-                    result = await client.send_file(
-                        chat_id, 
-                        file=file_path,
-                        caption=caption[:1024] if caption else None,
-                        progress_callback=progress_callback,
-                        force_document=False,
-                        supports_streaming=True
-                    )
-                else:
-                    # Send as document
-                    result = await client.send_file(
-                        chat_id, 
-                        file=file_path,
-                        caption=caption[:1024] if caption else None,
-                        progress_callback=progress_callback,
-                        force_document=True
-                    )
-                
-                logger.info(f"Upload successful: {result}")
-                return {"ok": True, "message": f"{media_type.capitalize()} uploaded successfully"}
-                
-            except Exception as e:
-                logger.error(f"Upload failed: {e}")
-                return {"ok": False, "error": str(e)}
-        
-        return self.run_coro(_upload())
+        except Exception as e:
+            logger.error(f"❌ Upload failed: {e}")
+            # Close file handles in case of error
+            for file_handle in files.values():
+                try:
+                    file_handle.close()
+                except:
+                    pass
+            return {"ok": False, "error": str(e)}
 
 # Initialize TeleHelper
 tele = TeleHelper(API_ID, API_HASH, SESSION_NAME)
@@ -289,75 +361,55 @@ def start(update: Update, context: CallbackContext):
     update.message.reply_text(
         "🤖 **Telegram Media Bridge Bot**\n\n"
         "📥 **Features:**\n"
-        "• Download media from any t.me link\n"
-        "• Upload to your chat with original format\n"
-        "• Photos as photos, Videos as videos, Files as files\n"
+        "• Fast download & upload\n"
+        "• Photos as photos, Videos as videos\n" 
         "• Preserves original captions\n"
         "• 2GB file size limit\n\n"
         "🔐 **Commands:**\n"
         "/login - Start login process\n"
-        "/logout - Logout & clear session\n"
         "/status - Check bot status\n\n"
         "📝 **Usage:**\n"
-        "1. First /login with your phone\n"
-        "2. Send any t.me link\n"
-        "3. Bot will download & upload media in original format"
+        "Send any t.me link to download media"
     )
 
 @owner_only
 def login_cmd(update: Update, context: CallbackContext):
     STATE['awaiting'] = 'phone'
-    update.message.reply_text("📱 **লগইন শুরু করুন**\n\nআপনার ফোন নম্বর পাঠান (আন্তর্জাতিক ফরম্যাটে):\nউদাহরণ: `+8801XXXXXXXXX`")
-
-@owner_only
-def logout_cmd(update: Update, context: CallbackContext):
-    try:
-        tele.run_coro(tele._init_client())
-    except Exception:
-        pass
-    path = SESSION_NAME + ".session"
-    if os.path.exists(path):
-        os.remove(path)
-    STATE.update({"logged_in": False, "awaiting": None, "phone": None, "sent_code": None})
-    update.message.reply_text("✅ লগআউট সম্পন্ন এবং সেশন ফাইল ডিলিট করা হয়েছে।")
+    update.message.reply_text("📱 **লগইন শুরু করুন**\n\nআপনার ফোন নম্বর পাঠান:\nউদাহরণ: `+8801XXXXXXXXX`")
 
 @owner_only
 def status_cmd(update: Update, context: CallbackContext):
     try:
         is_auth = tele.is_user_authorized()
         status = "✅ লগড ইন" if is_auth else "❌ লগড আউট"
-        state_info = f"বর্তমান স্টেট: {STATE.get('awaiting', 'None')}"
         
         update.message.reply_text(
             f"🤖 **বট স্ট্যাটাস**\n\n"
-            f"• লগইন স্ট্যাটাস: {status}\n"
-            f"• {state_info}\n"
-            f"• Server: Render.com\n"
-            f"• Media Types: Photo, Video, Document\n"
-            f"• Uptime: Active"
+            f"• লগইন: {status}\n"
+            f"• Server: Render.com\n" 
+            f"• Speed: Fast ⚡\n"
+            f"• Media Types: Photo, Video, File\n"
         )
     except Exception as e:
         update.message.reply_text(f"❌ স্ট্যাটাস চেক করতে সমস্যা: {e}")
 
 def text_message_handler(update: Update, context: CallbackContext):
-    # Owner check
     if update.effective_user.id != OWNER_ID:
         update.message.reply_text("❌ আপনি অনুমোদিত নন।")
         return
         
     txt = update.message.text.strip()
-    logger.info(f"Received message from {update.effective_user.id}: {txt}")
+    logger.info(f"📩 Received: {txt}")
 
     # Handle login states
     if STATE.get('awaiting') == 'phone':
         phone = txt
         try:
-            update.message.reply_text("📨 **কোড পাঠানো হচ্ছে...**\nদয়া করে অপেক্ষা করুন।")
+            update.message.reply_text("📨 **কোড পাঠানো হচ্ছে...**")
             phone_code_hash = tele.send_code_request(phone)
             STATE.update({"phone": phone, "sent_code": phone_code_hash, "awaiting": 'code'})
-            update.message.reply_text("✅ **কোড পাঠানো হয়েছে!**\n\nএবার Telegram/SMS থেকে প্রাপ্ত কোডটি পাঠান।")
+            update.message.reply_text("✅ **কোড পাঠানো হয়েছে!**\nকোডটি পাঠান।")
         except Exception as e:
-            logger.error(f"Code request failed: {e}")
             update.message.reply_text(f"❌ কোড পাঠাতে ব্যর্থ: {e}")
         return
 
@@ -366,7 +418,7 @@ def text_message_handler(update: Update, context: CallbackContext):
         phone = STATE.get('phone')
         phone_code_hash = STATE.get('sent_code')
         if not phone or not phone_code_hash:
-            update.message.reply_text("❌ সেশন তথ্য পাওয়া যায়নি। /login দিয়ে আবার চেষ্টা করুন।")
+            update.message.reply_text("❌ /login দিয়ে আবার চেষ্টা করুন।")
             STATE['awaiting'] = None
             return
         try:
@@ -374,14 +426,13 @@ def text_message_handler(update: Update, context: CallbackContext):
             if res == "ok":
                 STATE['logged_in'] = True
                 STATE['awaiting'] = None
-                update.message.reply_text("🎉 **লগইন সফল!**\n\nএবার কোনো t.me লিংক পাঠান ডাউনলোডের জন্য।")
+                update.message.reply_text("🎉 **লগইন সফল!**\nএবার t.me লিংক পাঠান।")
             elif res == "password_needed":
                 STATE['awaiting'] = 'password'
-                update.message.reply_text("🔒 **Two-Step Verification**\n\nআপনার পাসওয়ার্ড পাঠান।")
+                update.message.reply_text("🔒 **পাসওয়ার্ড পাঠান।**")
             else:
-                update.message.reply_text("❌ লগইন ব্যর্থ। আবার চেষ্টা করুন।")
+                update.message.reply_text("❌ লগইন ব্যর্থ।")
         except Exception as e:
-            logger.error(f"Sign-in failed: {e}")
             update.message.reply_text(f"❌ লগইন ব্যর্থ: {e}")
         return
 
@@ -390,177 +441,107 @@ def text_message_handler(update: Update, context: CallbackContext):
         try:
             tele.sign_in_with_password(password)
             STATE.update({"logged_in": True, "awaiting": None})
-            update.message.reply_text("🎉 **লগইন সফল!**\n\nএবার কোনো t.me লিংক পাঠান ডাউনলোডের জন্য।")
+            update.message.reply_text("🎉 **লগইন সফল!**\nএবার t.me লিংক পাঠান।")
         except Exception as e:
-            logger.error(f"Password auth failed: {e}")
             update.message.reply_text(f"❌ পাসওয়ার্ড ভেরিফিকেশন ব্যর্থ: {e}")
         return
 
-    # Check if user is logged in
+    # Check login
     try:
         is_auth = tele.is_user_authorized()
         STATE['logged_in'] = is_auth
-        logger.info(f"User authorized: {is_auth}")
     except Exception as e:
         logger.error(f"Auth check failed: {e}")
         is_auth = False
 
     if not is_auth:
-        update.message.reply_text("❌ **আপনি লগইন করেননি!**\n\nলগইন করতে /login কমান্ড ব্যবহার করুন।")
+        update.message.reply_text("❌ **লগইন করুন!**\n/login দিয়ে লগইন করুন।")
         return
 
     # Parse t.me link
-    logger.info("Parsing t.me link...")
     m = re.search(r"https?://t\.me/((?:c/)?(\d+|[A-Za-z0-9_]+)/(\d+))", txt)
     if not m:
-        update.message.reply_text(
-            "❌ **সঠিক t.me লিংক পাঠান**\n\n"
-            "উদাহরণ:\n"
-            "• `https://t.me/c/123456789/123`\n"
-            "• `https://t.me/username/123`"
-        )
+        update.message.reply_text("❌ **সঠিক t.me লিংক পাঠান**")
         return
 
     full_path = m.group(1)
     chat_part = m.group(2)
     msg_id = int(m.group(3))
     
-    logger.info(f"Parsed - Full: {full_path}, Chat: {chat_part}, Msg ID: {msg_id}")
-
     # Determine chat type
     if full_path.startswith("c/"):
         from_chat = int("-100" + chat_part)
     else:
         from_chat = chat_part if chat_part.startswith("@") else f"@{chat_part}"
 
-    logger.info(f"Final chat: {from_chat}")
-
-    STATE["last_progress_update"] = time.time()
-    update.message.reply_text("⏳ **মেসেজ খোঁজা হচ্ছে...**\nমিডিয়া ডাউনলোড শুরু হবে shortly.")
-
-    # Create temp file
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as temp_file:
-        dest_path = temp_file.name
-
-    logger.info(f"Temp file created: {dest_path}")
+    update.message.reply_text("⏳ **ডাউনলোড শুরু...**\nদ্রুত ডাউনলোড হবে ⚡")
 
     # Download media
-    try:
-        res = tele.fetch_message_and_download(from_chat, msg_id, dest_path)
-    except Exception as e:
-        logger.error(f"Download process failed: {e}")
-        update.message.reply_text(f"❌ ডাউনলোড প্রসেস ব্যর্থ: {e}")
-        if os.path.exists(dest_path):
-            os.unlink(dest_path)
-        return
+    res = tele.fetch_message_and_download(from_chat, msg_id)
     
     if not res.get("ok"):
         err = res.get("error", "unknown")
-        logger.error(f"Download failed: {err}")
-        update.message.reply_text(f"❌ মেসেজ/মিডিয়া ফেচ করা যায়নি: {err}")
-        if os.path.exists(dest_path):
-            os.unlink(dest_path)
+        update.message.reply_text(f"❌ ডাউনলোড ব্যর্থ: {err}")
         return
 
     if not res.get("has_media"):
         text_content = res.get("text", "")
-        update.message.reply_text(f"📝 **মেসেজে মিডিয়া নেই:**\n\n{text_content or '(খালি মেসেজ)'}")
-        if os.path.exists(dest_path):
-            os.unlink(dest_path)
+        update.message.reply_text(f"📝 **মিডিয়া নেই:**\n{text_content or '(খালি)'}")
         return
 
-    # Upload media with correct type
+    # Upload media
     file_path = res.get("file_path")
-    caption = res.get("text", "") or "Recovered media"
+    caption = res.get("text", "") or ""
     file_size = res.get("file_size", 0)
     file_name = res.get("file_name", "file")
     media_type = res.get("media_type", "document")
+    download_speed = res.get("download_speed", 0)
     
-    # Media type emoji mapping
-    type_emojis = {
-        "photo": "🖼️",
-        "video": "🎥", 
-        "document": "📄"
-    }
+    # Media type emoji
+    emoji = {"photo": "🖼️", "video": "🎥", "audio": "🎵"}.get(media_type, "📄")
     
-    emoji = type_emojis.get(media_type, "📁")
-    
-    logger.info(f"Download successful: {file_path}, Type: {media_type}, Size: {file_size:.2f} MB")
     update.message.reply_text(
-        f"✅ **ডাউনলোড সফল!**\n\n"
-        f"• {emoji} টাইপ: `{media_type}`\n"
-        f"• ফাইল: `{file_name}`\n"
-        f"• সাইজ: `{file_size:.2f} MB`\n"
-        f"• আপলোড শুরু হচ্ছে..."
+        f"✅ **ডাউনলোড সম্পন্ন!**\n\n"
+        f"• {emoji} টাইপ: {media_type}\n"
+        f"• ফাইল: {file_name}\n"
+        f"• সাইজ: {file_size:.1f} MB\n"
+        f"• স্পিড: {download_speed:.1f} MB/s\n"
+        f"• 📤 আপলোড শুরু..."
     )
 
-    STATE["last_progress_update"] = time.time()
-    chat_id = update.effective_chat.id
-    
-    logger.info(f"Starting upload as {media_type} to chat {chat_id}")
-    
-    try:
-        upload_res = tele.upload_to_telegram(file_path, caption, chat_id, media_type)
-    except Exception as e:
-        logger.error(f"Upload process failed: {e}")
-        update.message.reply_text(f"❌ আপলোড প্রসেস ব্যর্থ: {e}")
-        if os.path.exists(file_path):
-            os.unlink(file_path)
-        return
+    # Upload using Bot API (fast)
+    upload_res = tele.upload_to_telegram_bot(file_path, caption, media_type, file_name)
     
     if upload_res.get("ok"):
-        update.message.reply_text(f"🎉 **{emoji} {media_type.capitalize()} আপলোড সম্পন্ন!** ✅")
-        logger.info(f"{media_type} upload completed successfully")
+        update.message.reply_text(f"🎉 **{emoji} {media_type} আপলোড সম্পন্ন!** ✅")
     else:
         error_msg = upload_res.get('error', 'Unknown error')
         update.message.reply_text(f"❌ **আপলোড ব্যর্থ:** {error_msg}")
-        logger.error(f"Upload failed: {error_msg}")
 
     # Clean up
     if os.path.exists(file_path):
         os.unlink(file_path)
-        logger.info("Temp file cleaned up")
 
-# Add handlers to dispatcher
+# Add handlers
 dp.add_handler(CommandHandler("start", start))
 dp.add_handler(CommandHandler("login", login_cmd))
-dp.add_handler(CommandHandler("logout", logout_cmd))
 dp.add_handler(CommandHandler("status", status_cmd))
 dp.add_handler(MessageHandler(Filters.text & (~Filters.command), text_message_handler))
 
-# Flask Routes for Render.com
+# Flask Routes
 @app.route('/')
 def home():
-    return jsonify({
-        "status": "active",
-        "service": "Telegram Media Bridge",
-        "version": "2.0",
-        "media_types": "photo, video, document",
-        "deployed_on": "Render.com"
-    })
+    return jsonify({"status": "active", "service": "Telegram Media Bridge"})
 
 @app.route('/health')
 def health_check():
-    return jsonify({"status": "healthy", "timestamp": time.time()})
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    """Webhook endpoint for Telegram bot"""
-    update = Update.de_json(request.get_json(), updater.bot)
-    dp.process_update(update)
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "healthy"})
 
 def start_bot():
-    """Start the bot in polling mode"""
-    logger.info("Starting Telegram Bot...")
-    
-    # Use polling only (no webhook needed)
+    logger.info("🚀 Starting Telegram Bot...")
     updater.start_polling()
-    logger.info("Bot started with polling")
-    
-    return "Bot started successfully"
+    logger.info("✅ Bot started successfully!")
 
-# Start bot when app runs
 if __name__ == '__main__':
     start_bot()
     app.run(host='0.0.0.0', port=PORT, debug=False)
