@@ -21,8 +21,8 @@ from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, Callb
 # CONFIGURATION
 # -----------------------
 API_ID = int(os.environ.get('API_ID', ''))
-API_HASH = os.environ.get('API_HASH', '')
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
+API_HASH = os.environ.get('API_HASH', ''))
+BOT_TOKEN = os.environ.get('BOT_TOKEN', ''))
 OWNER_ID = int(os.environ.get('OWNER_ID', ''))
 
 if not all([API_ID, API_HASH, BOT_TOKEN, OWNER_ID]):
@@ -144,7 +144,7 @@ class TelethonManager:
             if hasattr(message.media, 'document'):
                 file_size = message.media.document.size
             elif hasattr(message.media, 'photo'):
-                file_size = message.media.photo.sizes[-1].size if message.media.photo.sizes else 0
+                file_size = message.media.photo.size
             else:
                 file_size = 0
             
@@ -287,13 +287,9 @@ def phone_handler(update: Update, context: CallbackContext):
             update.message.reply_text(f"❌ Failed: {message}")
             return ConversationHandler.END
     
-    # Run async function synchronously in thread
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        next_state = loop.run_until_complete(send_code())
-    finally:
-        loop.close()
+    # Run async function
+    result = asyncio.run_coroutine_threadsafe(send_code(), asyncio.get_event_loop())
+    next_state = result.result(timeout=30)
     
     return next_state
 
@@ -309,13 +305,9 @@ def code_handler(update: Update, context: CallbackContext):
             update.message.reply_text(f"❌ Login failed: {message}")
         return ConversationHandler.END
     
-    # Run async function synchronously in thread
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(verify_code())
-    finally:
-        loop.close()
+    # Run async function
+    result = asyncio.run_coroutine_threadsafe(verify_code(), asyncio.get_event_loop())
+    result.result(timeout=30)
     
     return ConversationHandler.END
 
@@ -367,8 +359,7 @@ async def process_media_download(chat_identifier, message_id, update: Update):
     """Process media download and upload with progress updates"""
     try:
         if not telethon_mgr.is_connected:
-            await update.message.reply_text("❌ Not logged in. Use /login first")
-            return
+            return "❌ Not logged in. Use /login first"
         
         # Send initial status
         status_msg = await update.message.reply_text("⚡ Starting download...")
@@ -431,13 +422,11 @@ def handle_message(update: Update, context: CallbackContext):
     chat_identifier, message_id = matches[0]
     message_id = int(message_id)
     
-    # Run async processing synchronously in thread
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(process_media_download(chat_identifier, message_id, update))
-    finally:
-        loop.close()
+    # Run async processing
+    async def run_processing():
+        await process_media_download(chat_identifier, message_id, update)
+    
+    asyncio.run_coroutine_threadsafe(run_processing(), asyncio.get_event_loop())
 
 # Register handlers
 conv_handler = ConversationHandler(
