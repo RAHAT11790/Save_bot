@@ -1,4 +1,4 @@
-python-telegram-bot==13.15
+python-telegram-bot==12.8
 telethon==1.28.0
 Flask==2.3.3
 requests==2.31.0
