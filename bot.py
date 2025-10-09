@@ -1,12 +1,8 @@
----
-
-### **bot.py**
-```python
 #!/usr/bin/env python3
 """
-Telegram Media Bridge - FULL RENDER READY
+Telegram Media Bridge - MAXIMUM SPEED OPTIMIZED
+Optimized for Render.com free tier
 """
-
 import os
 import re
 import time
@@ -15,13 +11,11 @@ import tempfile
 import threading
 import asyncio
 from functools import wraps
-from flask import Flask, jsonify
+from flask import Flask, request, jsonify
 from telethon import TelegramClient, errors
 from telegram import Update
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
-import requests
-from dotenv import load_dotenv
-
+# বাকি কোড এখানে...
 # Load environment
 load_dotenv()
 
