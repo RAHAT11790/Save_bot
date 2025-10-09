@@ -7,24 +7,20 @@ import asyncio
 import logging
 from functools import wraps
 from flask import Flask
-from dotenv import load_dotenv
 from telethon import TelegramClient, errors
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
 import requests
 
-# Load environment variables
-load_dotenv()
-
 # ------------------------
-# Config
+# Config - Environment variables
 # ------------------------
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-SESSION_NAME = os.getenv("SESSION_NAME", "user")
+API_ID = int(os.environ.get("API_ID", "0"))
+API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
+SESSION_NAME = os.environ.get("SESSION_NAME", "user")
 MAX_FILE_SIZE = 1024 * 1024 * 1024  # 1GB
-PORT = int(os.getenv("PORT", "10000"))
+PORT = int(os.environ.get("PORT", "10000"))
 
 if not all([API_ID, API_HASH, BOT_TOKEN, OWNER_ID]):
     raise ValueError("Missing required environment variables")
