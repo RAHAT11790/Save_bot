@@ -144,7 +144,7 @@ class TelethonManager:
             if hasattr(message.media, 'document'):
                 file_size = message.media.document.size
             elif hasattr(message.media, 'photo'):
-                file_size = message.media.photo.size
+                file_size = message.media.photo.sizes[-1].size if message.media.photo.sizes else 0
             else:
                 file_size = 0
             
@@ -287,9 +287,13 @@ def phone_handler(update: Update, context: CallbackContext):
             update.message.reply_text(f"❌ Failed: {message}")
             return ConversationHandler.END
     
-    # Run async function
-    result = asyncio.run_coroutine_threadsafe(send_code(), asyncio.get_event_loop())
-    next_state = result.result(timeout=30)
+    # Run async function synchronously in thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        next_state = loop.run_until_complete(send_code())
+    finally:
+        loop.close()
     
     return next_state
 
@@ -305,9 +309,13 @@ def code_handler(update: Update, context: CallbackContext):
             update.message.reply_text(f"❌ Login failed: {message}")
         return ConversationHandler.END
     
-    # Run async function
-    result = asyncio.run_coroutine_threadsafe(verify_code(), asyncio.get_event_loop())
-    result.result(timeout=30)
+    # Run async function synchronously in thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(verify_code())
+    finally:
+        loop.close()
     
     return ConversationHandler.END
 
@@ -359,7 +367,8 @@ async def process_media_download(chat_identifier, message_id, update: Update):
     """Process media download and upload with progress updates"""
     try:
         if not telethon_mgr.is_connected:
-            return "❌ Not logged in. Use /login first"
+            await update.message.reply_text("❌ Not logged in. Use /login first")
+            return
         
         # Send initial status
         status_msg = await update.message.reply_text("⚡ Starting download...")
@@ -422,11 +431,13 @@ def handle_message(update: Update, context: CallbackContext):
     chat_identifier, message_id = matches[0]
     message_id = int(message_id)
     
-    # Run async processing
-    async def run_processing():
-        await process_media_download(chat_identifier, message_id, update)
-    
-    asyncio.run_coroutine_threadsafe(run_processing(), asyncio.get_event_loop())
+    # Run async processing synchronously in thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(process_media_download(chat_identifier, message_id, update))
+    finally:
+        loop.close()
 
 # Register handlers
 conv_handler = ConversationHandler(
@@ -474,21 +485,21 @@ def stop_services():
 if __name__ == "__main__":
     try:
         # Start Flask app in background thread for Render
-    def run_flask():
-        app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
-    
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    
-    # Start bot services
-    start_services()
-    
-    logger.info("🚀 Bot is now fully operational!")
-    logger.info("🌐 Flask server running on port 5000 for Uptime Robot")
-    
-    # Keep the bot running
-    updater.idle()
+        def run_flask():
+            app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
         
+        flask_thread = threading.Thread(target=run_flask, daemon=True)
+        flask_thread.start()
+        
+        # Start bot services
+        start_services()
+        
+        logger.info("🚀 Bot is now fully operational!")
+        logger.info("🌐 Flask server running on port 5000 for Uptime Robot")
+        
+        # Keep the bot running
+        updater.idle()
+            
     except KeyboardInterrupt:
         logger.info("Received interrupt signal...")
     except Exception as e:
