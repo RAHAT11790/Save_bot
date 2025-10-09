@@ -1,48 +1,51 @@
+---
+
+### **bot.py**
+```python
 #!/usr/bin/env python3
 """
-Telegram Media Bridge - MAX SPEED
-Optimized for Render.com (Python 3.10)
+Telegram Media Bridge - FULL RENDER READY
 """
 
 import os
 import re
 import time
+import logging
 import tempfile
 import threading
 import asyncio
-import logging
 from functools import wraps
 from flask import Flask, jsonify
 from telethon import TelegramClient, errors
 from telegram import Update
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 import requests
+from dotenv import load_dotenv
 
-# -----------------------
-# Configuration
-# -----------------------
-API_ID = int(os.environ.get('API_ID', ''))
-API_HASH = os.environ.get('API_HASH', '')
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
-OWNER_ID = int(os.environ.get('OWNER_ID', ''))
-SESSION_NAME = os.environ.get('SESSION_NAME', 'session')
+# Load environment
+load_dotenv()
+
+API_ID = int(os.environ.get('API_ID'))
+API_HASH = os.environ.get('API_HASH')
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+OWNER_ID = int(os.environ.get('OWNER_ID'))
+SESSION_NAME = os.environ.get('SESSION_NAME', 'user')
 PORT = int(os.environ.get('PORT', 10000))
-MAX_FILE_SIZE = 1 * 1024 * 1024 * 1024  # 1 GB
 
-# Validate environment
-if not all([API_ID, API_HASH, BOT_TOKEN, OWNER_ID]):
-    raise ValueError("❌ Missing environment variables")
+MAX_FILE_SIZE = 1024 * 1024 * 1024  # 1 GB
 
-# Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("telebridge")
 
-# Global State
 STATE = {"phone": None, "sent_code": None, "awaiting": None, "logged_in": False}
+DOWNLOAD_PROGRESS = {}
+UPLOAD_PROGRESS = {}
 
-# -----------------------
+app = Flask(__name__)
+
+# -------------------
 # TeleHelper
-# -----------------------
+# -------------------
 class TeleHelper:
     def __init__(self, api_id, api_hash, session_name):
         self.api_id = api_id
@@ -78,7 +81,7 @@ class TeleHelper:
         async def _sign():
             client = await self._init_client()
             try:
-                me = await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
+                me = await client.sign_in(phone, code, phone_code_hash)
                 return "ok", me
             except errors.SessionPasswordNeededError:
                 return "password_needed", None
@@ -102,130 +105,139 @@ class TeleHelper:
             msg = await client.get_messages(chat, ids=msg_id)
             if not msg or not msg.media:
                 return {"ok": False, "error": "No media"}
-            # Detect file type
-            media_type = "photo" if "Photo" in str(msg.media) else "video" if "Video" in str(msg.media) else "document"
-            ext = ".jpg" if media_type=="photo" else ".mp4" if media_type=="video" else ".bin"
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
-            path = await client.download_media(msg, file=tmp.name)
+
+            ext = ".jpg" if "Photo" in str(msg.media) else ".mp4" if "Video" in str(msg.media) else ".bin"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as f:
+                path = f.name
+
+            await client.download_media(msg, file=path)
             size = os.path.getsize(path)
             if size > MAX_FILE_SIZE:
                 os.unlink(path)
-                return {"ok": False, "error": "File too large (>1GB)"}
-            return {"ok": True, "file_path": path, "media_type": media_type, "file_size": size, "text": msg.text or ""}
+                return {"ok": False, "error": "File too large"}
+            return {"ok": True, "file_path": path, "media_type": "photo" if ext==".jpg" else "video" if ext==".mp4" else "document", "text": msg.text or ""}
         return self.run_coro(_fetch())
 
-    def upload_to_bot(self, file_path, caption, media_type):
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/"
-        data = {"chat_id": OWNER_ID, "caption": caption[:1024]}
+    def upload_to_telegram_bot(self, file_path, caption, media_type):
         files = {}
-        if media_type=="photo":
-            files['photo'] = open(file_path,'rb')
-            method = "sendPhoto"
-        elif media_type=="video":
-            files['video'] = open(file_path,'rb')
-            data['supports_streaming'] = True
-            method = "sendVideo"
+        data = {"chat_id": OWNER_ID, "caption": caption[:1024]}
+
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+        if media_type == "photo":
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+            files["photo"] = open(file_path, "rb")
+        elif media_type == "video":
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
+            files["video"] = open(file_path, "rb")
         else:
-            files['document'] = open(file_path,'rb')
-            method = "sendDocument"
-        res = requests.post(url+method, data=data, files=files)
+            files["document"] = open(file_path, "rb")
+
+        res = requests.post(url, data=data, files=files)
         for f in files.values(): f.close()
-        return res.json()
+        if res.status_code == 200:
+            return {"ok": True}
+        return {"ok": False, "error": res.text}
 
+# -------------------
 tele = TeleHelper(API_ID, API_HASH, SESSION_NAME)
-
-# -----------------------
-# Flask
-# -----------------------
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return jsonify({"status":"active"})
-
-@app.route('/health')
-def health():
-    return jsonify({"status":"healthy"})
-
-# -----------------------
-# Telegram Bot
-# -----------------------
 updater = Updater(BOT_TOKEN, use_context=True)
 dp = updater.dispatcher
 
-def owner_only(func):
-    @wraps(func)
-    def wrapper(update, context, *args, **kwargs):
+# -------------------
+# Bot handlers
+# -------------------
+def owner_only(handler):
+    @wraps(handler)
+    def inner(update, context, *args, **kwargs):
         if update.effective_user.id != OWNER_ID:
             update.message.reply_text("❌ অনুমোদিত নয়")
             return
-        return func(update, context, *args, **kwargs)
-    return wrapper
+        return handler(update, context, *args, **kwargs)
+    return inner
 
 @owner_only
-def start_cmd(update, context):
-    update.message.reply_text("🤖 MAX SPEED BOT READY\n\nSend t.me link to fetch media.")
+def start(update, context):
+    update.message.reply_text("🤖 MAX SPEED BOT Ready")
 
 @owner_only
+def login_cmd(update, context):
+    STATE["awaiting"] = "phone"
+    update.message.reply_text("📱 ফোন নম্বর পাঠান")
+
+@owner_only
+def status_cmd(update, context):
+    status = "✅ লগইন" if tele.is_user_authorized() else "❌ লগআউট"
+    update.message.reply_text(f"Status: {status}")
+
 def text_handler(update, context):
     txt = update.message.text.strip()
-    if STATE.get('awaiting')=='phone':
+    if STATE.get("awaiting") == "phone":
         phone = txt
-        phone_code = tele.send_code_request(phone)
-        STATE.update({"phone": phone, "sent_code": phone_code, "awaiting": "code"})
-        update.message.reply_text("📨 Code sent. Send the code here.")
+        phone_hash = tele.send_code_request(phone)
+        STATE.update({"phone": phone, "sent_code": phone_hash, "awaiting": "code"})
+        update.message.reply_text("✅ কোড পাঠানো হয়েছে")
         return
-    if STATE.get('awaiting')=='code':
+    if STATE.get("awaiting") == "code":
         code = txt
-        phone = STATE['phone']
-        code_hash = STATE['sent_code']
-        res, _ = tele.sign_in_with_code(phone, code, code_hash)
-        if res=="ok":
-            STATE.update({"awaiting": None, "logged_in": True})
-            update.message.reply_text("🎉 Logged in successfully! Send t.me link.")
+        res, _ = tele.sign_in_with_code(STATE["phone"], code, STATE["sent_code"])
+        if res == "ok":
+            STATE.update({"logged_in": True, "awaiting": None})
+            update.message.reply_text("🎉 লগইন সফল")
         elif res=="password_needed":
-            STATE['awaiting']="password"
-            update.message.reply_text("🔒 Send 2FA password.")
+            STATE["awaiting"]="password"
+            update.message.reply_text("🔒 পাসওয়ার্ড পাঠান")
         return
-    if STATE.get('awaiting')=='password':
-        password = txt
-        tele.sign_in_with_password(password)
-        STATE.update({"awaiting": None, "logged_in": True})
-        update.message.reply_text("🎉 Logged in successfully! Send t.me link.")
+    if STATE.get("awaiting") == "password":
+        pwd = txt
+        tele.sign_in_with_password(pwd)
+        STATE.update({"logged_in": True, "awaiting": None})
+        update.message.reply_text("🎉 লগইন সফল")
         return
 
-    # t.me link parse
+    # Parse t.me link
     m = re.search(r"https?://t\.me/((?:c/)?(\d+|[A-Za-z0-9_]+)/(\d+))", txt)
     if not m:
-        update.message.reply_text("❌ Send valid t.me link")
+        update.message.reply_text("❌ সঠিক t.me লিংক পাঠান")
         return
-    full_path, chat_part, msg_id = m.group(1), m.group(2), int(m.group(3))
-    chat = int("-100"+chat_part) if full_path.startswith("c/") else f"@{chat_part}"
-
-    update.message.reply_text("⚡ Downloading...")
-    res = tele.fetch_message_and_download(chat, msg_id)
-    if not res.get("ok"):
-        update.message.reply_text(f"❌ {res.get('error')}")
-        return
-    file_path, media_type, caption = res['file_path'], res['media_type'], res['text']
-    update.message.reply_text(f"✅ Download complete ({tele.format_size(res['file_size'])})\nUploading...")
-
-    up_res = tele.upload_to_bot(file_path, caption, media_type)
-    if up_res.get("ok"):
-        update.message.reply_text("🎉 Upload successful!")
+    full_path = m.group(1)
+    chat_part = m.group(2)
+    msg_id = int(m.group(3))
+    if full_path.startswith("c/"):
+        chat = int("-100"+chat_part)
     else:
-        update.message.reply_text(f"❌ Upload failed: {up_res}")
+        chat = chat_part if chat_part.startswith("@") else f"@{chat_part}"
 
-    if os.path.exists(file_path):
-        os.unlink(file_path)
+    update.message.reply_text("⚡ ডাউনলোড শুরু...")
+    res = tele.fetch_message_and_download(chat, msg_id)
+    if not res["ok"]:
+        update.message.reply_text(f"❌ ডাউনলোড ব্যর্থ: {res.get('error')}")
+        return
+    file_path = res["file_path"]
+    media_type = res["media_type"]
+    caption = res["text"] or ""
+    update.message.reply_text("🚀 আপলোড শুরু...")
+    upl = tele.upload_to_telegram_bot(file_path, caption, media_type)
+    if upl["ok"]:
+        update.message.reply_text("🎉 আপলোড সম্পন্ন!")
+    else:
+        update.message.reply_text(f"❌ আপলোড ব্যর্থ: {upl.get('error')}")
+    os.unlink(file_path)
 
-dp.add_handler(CommandHandler("start", start_cmd))
+dp.add_handler(CommandHandler("start", start))
+dp.add_handler(CommandHandler("login", login_cmd))
+dp.add_handler(CommandHandler("status", status_cmd))
 dp.add_handler(MessageHandler(Filters.text & (~Filters.command), text_handler))
+
+# -------------------
+@app.route("/")
+def home(): return jsonify({"status":"active"})
+@app.route("/health")
+def health(): return jsonify({"status":"healthy"})
 
 def start_bot():
     updater.start_polling()
-    logger.info("🚀 Bot running")
+    logger.info("✅ Bot ready")
 
 if __name__=="__main__":
     start_bot()
-    app.run(host='0.0.0.0', port=PORT)
+    app.run(host="0.0.0.0", port=PORT, threaded=True)
