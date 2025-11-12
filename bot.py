@@ -1,497 +1,272 @@
-#!/usr/bin/env python3
-"""
-High Speed Telegram Media Bot with Phone Login
-Python 3.11 compatible for Render
-"""
-
 import os
 import re
-import asyncio
 import logging
-import tempfile
-import threading
-from functools import wraps
-from flask import Flask, jsonify
-from telethon import TelegramClient
-from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument, MessageMediaVideo
-from telegram import Update
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, ConversationHandler
+import asyncio
+from pyrogram import Client, filters
+from pyrogram.types import Message
+from pyrogram.enums import ParseMode
+from collections import deque
 
-# -----------------------
-# CONFIGURATION
-# -----------------------
-API_ID = int(os.environ.get('API_ID', ''))
-API_HASH = os.environ.get('API_HASH', '')
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
-OWNER_ID = int(os.environ.get('OWNER_ID', ''))
+# Logging configuration
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-if not all([API_ID, API_HASH, BOT_TOKEN, OWNER_ID]):
-    raise ValueError("Missing required environment variables!")
+# Bot configuration - Environment Variables
+API_ID = os.environ.get("API_ID")
+API_HASH = os.environ.get("API_HASH")
+BOTOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# Configuration
-MAX_FILE_SIZE = 1 * 1024 * 1024 * 1024  # 1GB
-CHUNK_SIZE = 10 * 1024 * 1024  # 10MB chunks for large files
+# Initialize bot
+app = Client("caption_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# Conversation states
-PHONE, CODE, PASSWORD = range(3)
+# Global storage
+user_caption_template = ""
+video_queue = deque()
+processing = False
+processor_started = False
 
-# Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("TelegramMediaBot")
+def extract_episode_and_quality(caption_text, filename):
+    """Extract episode and quality from caption and filename"""
+    episode = None
+    quality = None
 
-# -----------------------
-# FLASK APP (for Render & Uptime Robot)
-# -----------------------
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return jsonify({"status": "Bot is running", "service": "telegram-media-bot"})
-
-@app.route('/health')
-def health():
-    return jsonify({"status": "healthy", "bot": "active"})
-
-@app.route('/ping')
-def ping():
-    return jsonify({"status": "pong"})
-
-# -----------------------
-# TELETHON CLIENT MANAGER
-# -----------------------
-class TelethonManager:
-    _instance = None
-    _lock = threading.Lock()
+    text_to_scan = ""
+    if caption_text: text_to_scan += caption_text + " "
+    if filename: text_to_scan += filename + " "
+    logger.info(f"Scanning text: {text_to_scan}")
     
-    def __new__(cls):
-        with cls._lock:
-            if cls._instance is None:
-                cls._instance = super(TelethonManager, cls).__new__(cls)
-                cls._instance._initialized = False
-            return cls._instance
+    # Improved episode patterns with better Unicode and symbol handling
+    episode_patterns = [
+        r'Episode\s*[:=-]+\s*(\d+)',  # "Episode :- 11" (with colon and dash)
+        r'Episode\s*[:=-]\s*(\d+)',   # "Episode :- 11"
+        r'Episode\s*[∶＝—–-]\s*(\d+)', # Various dash types
+        r'Episode\s*:\s*(\d+)',       # "Episode : 11"
+        r'Episode\s*-\s*(\d+)',       # "Episode - 11"
+        r'Epi\s*[:=-]+\s*(\d+)',      # "Epi :- 11"
+        r'EP\s*[:=-]+\s*(\d+)',       # "EP :- 11"
+        r'E\s*(\d+)',                 # "E 11"
+        r'E(\d+)',                    # "E11"
+        r'Episode\s*(\d+)',           # "Episode 11"
+        r'⊙ Episode\s*:\s*(\d+)',     # Other formats
+        r'›› 𝖤𝗉𝗂𝗌𝗈𝖽𝖾\s*:\s*(\d+)',
+        r'✅\s*Episode\s*[:=-]+\s*(\d+)', # "✅ Episode :- 11"
+        r'▶\s*Episode\s*[:=-]+\s*(\d+)',  # "▶ Episode :- 11"
+        # Fallback patterns
+        r'[Ee]pisode.*?(\d+)',        # Any text with "episode" followed by number
+        r'[Ee]pi.*?(\d+)',            # Any text with "epi" followed by number
+    ]
     
-    def __init__(self):
-        if self._initialized:
-            return
-            
-        self.client = None
-        self.is_connected = False
-        self.phone_code_hash = None
-        self.phone_number = None
-        self._initialized = True
+    for pattern in episode_patterns:
+        match = re.search(pattern, text_to_scan, re.IGNORECASE)
+        if match:
+            try:
+                episode = int(match.group(1))
+                logger.info(f"Episode found with pattern '{pattern}': {episode}")
+                break
+            except ValueError:
+                continue
+
+    # If still no episode found, try more aggressive search
+    if episode is None:
+        # Look for any number that might be episode number (usually 1-3 digits)
+        number_matches = re.findall(r'\b(\d{1,3})\b', text_to_scan)
+        for num in number_matches:
+            num_int = int(num)
+            # Assume episode numbers are usually between 1 and 999
+            if 1 <= num_int <= 999:
+                # Check if this number appears near "episode" text
+                episode_context = re.search(r'[Ee]pisode[^\\d]*' + num, text_to_scan, re.IGNORECASE)
+                if episode_context:
+                    episode = num_int
+                    logger.info(f"Episode found with context search: {episode}")
+                    break
+
+    # More flexible quality patterns
+    quality_patterns = [
+        r'Quality\s*[:=-]+\s*([^\n\r]+)',      # "Quality :- 720p"
+        r'🟡 Quality\s*[:=-]+\s*([^\n\r]+)',   # "🟡 Quality :- 720p"
+        r'Quality\s*[:=-]\s*([^\n\r]+)',       # "Quality :- 720p"
+        r'⌬ Quality:\s*([^\n\r]+)',            # Other format
+        r'›› 𝖰𝗎𝖺𝗅𝗂𝗍𝗒\s*:\s*([^\n\r]+)',      # Other format
+        r'(\d+p)\s*?[^\n]*\]?'              # Generic "480p", "720p", "1080p"
+    ]
     
-    def initialize_client(self):
-        """Initialize Telethon client"""
-        try:
-            self.client = TelegramClient(
-                'media_bot_session',
-                API_ID,
-                API_HASH,
-                device_model="High Speed Media Bot",
-                system_version="4.0",
-                app_version="2.0"
-            )
-            logger.info("Telethon client initialized")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to initialize client: {e}")
-            return False
-    
-    async def connect_with_phone(self, phone_number):
-        """Start phone number authentication"""
-        try:
-            if not self.client:
-                self.initialize_client()
-            
-            await self.client.connect()
-            self.phone_number = phone_number
-            result = await self.client.send_code_request(phone_number)
-            self.phone_code_hash = result.phone_code_hash
-            return True, "Code sent successfully"
-        except Exception as e:
-            logger.error(f"Phone auth error: {e}")
-            return False, str(e)
-    
-    async def verify_code(self, code):
-        """Verify authentication code"""
-        try:
-            if not self.client or not self.phone_code_hash:
-                return False, "No active authentication session"
-            
-            await self.client.sign_in(
-                phone=self.phone_number,
-                code=code,
-                phone_code_hash=self.phone_code_hash
-            )
-            self.is_connected = True
-            return True, "Successfully authenticated"
-        except Exception as e:
-            logger.error(f"Code verification error: {e}")
-            return False, str(e)
-    
-    async def download_media(self, chat_identifier, message_id):
-        """Download media with chunked download for large files"""
-        try:
-            message = await self.client.get_messages(chat_identifier, ids=message_id)
-            
-            if not message or not message.media:
-                return {"success": False, "error": "Message or media not found"}
-            
-            # Get file size first
-            if hasattr(message.media, 'document'):
-                file_size = message.media.document.size
-            elif hasattr(message.media, 'photo'):
-                file_size = message.media.photo.size
+    for pattern in quality_patterns:
+        match = re.search(pattern, text_to_scan, re.IGNORECASE)
+        if match:
+            quality_text = match.group(1).strip()
+            # Extract just the resolution (480p, 720p, 1080p)
+            quality_match = re.search(r'(480p|720p|1080p)', quality_text, re.IGNORECASE)
+            if quality_match:
+                quality = quality_match.group(1).lower()
+                logger.info(f"Quality found with pattern '{pattern}': {quality}")
+                break
             else:
-                file_size = 0
+                # If no resolution found, use the full text but clean it
+                quality = re.sub(r'[^\w\s]', '', quality_text).strip()
+                logger.info(f"Quality found (raw) with pattern '{pattern}': {quality}")
+                break
+
+    # If still no quality found, try more generic patterns
+    if not quality:
+        quality_match = re.search(r'(\d+p)', text_to_scan, re.IGNORECASE)
+        if quality_match:
+            quality = quality_match.group(1).lower()
+            logger.info(f"Quality found with generic pattern: {quality}")
+
+    # Debug: Check what's being extracted
+    logger.info(f"Final extraction - Episode: {episode}, Quality: {quality}")
+    return episode, quality
+
+def fix_template_formatting(template):
+    """Fix template formatting to preserve line breaks and emojis"""
+    template = template.replace("━━━━━━━━━━━━━━━━━━━━━━━ ››", "━━━━━━━━━━━━━━━━━━━━━━━\n››")
+    template = template.replace("𝖧𝗂𝗇𝖽𝗂 ━━━━━━━━━━━━━━━━━━━━━━━", "𝖧𝗂𝗇𝖽𝗂\n━━━━━━━━━━━━━━━━━━━━━━━")
+    template = template.replace("➥ ᴊᴏɪɴ", "\n➥ ᴊᴏɪɴ")
+    lines = template.split('\n')
+    formatted_lines = [line.rstrip() for line in lines]  # preserve leading spaces
+    return '\n'.join(formatted_lines)
+
+def generate_final_caption(episode, quality):
+    """Generate final caption with perfect formatting"""
+    if not user_caption_template:
+        return None
+    fixed_template = fix_template_formatting(user_caption_template)
+    final_caption = fixed_template.replace("{episode}", str(episode)).replace("{quality}", quality)
+    return final_caption
+
+async def process_videos_serial():
+    """Process videos in exact serial order"""
+    global processing, processor_started
+    processor_started = True
+    logger.info("Processor started")
+
+    while True:
+        if not video_queue:
+            processing = False
+            await asyncio.sleep(0.1)
+            continue
             
-            if file_size > MAX_FILE_SIZE:
-                return {"success": False, "error": f"File too large ({file_size/1024/1024/1024:.2f}GB > 1GB)"}
-            
-            # Create temporary file
-            file_ext = self._get_file_extension(message.media)
-            with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
-                temp_path = temp_file.name
-            
-            # Download file
-            downloaded_path = await self.client.download_media(
-                message, 
-                file=temp_path
-            )
-            
-            actual_size = os.path.getsize(downloaded_path)
-            
-            return {
-                "success": True,
-                "file_path": downloaded_path,
-                "file_size": actual_size,
-                "file_type": self._get_media_type(message.media),
-                "caption": message.text or "",
-                "file_extension": file_ext
-            }
-            
-        except Exception as e:
-            logger.error(f"Download error: {e}")
-            return {"success": False, "error": str(e)}
-    
-    def _get_file_extension(self, media):
-        """Determine file extension based on media type"""
-        if isinstance(media, MessageMediaPhoto):
-            return ".jpg"
-        elif isinstance(media, MessageMediaVideo):
-            return ".mp4"
-        elif isinstance(media, MessageMediaDocument):
-            if media.document.mime_type:
-                if 'image' in media.document.mime_type:
-                    return ".jpg"
-                elif 'video' in media.document.mime_type:
-                    return ".mp4"
-                elif 'pdf' in media.document.mime_type:
-                    return ".pdf"
-            return ".bin"
-        return ".bin"
-    
-    def _get_media_type(self, media):
-        """Get media type for Telegram Bot API"""
-        if isinstance(media, MessageMediaPhoto):
-            return "photo"
-        elif isinstance(media, MessageMediaVideo):
-            return "video"
-        elif isinstance(media, MessageMediaDocument):
-            if media.document.mime_type and 'video' in media.document.mime_type:
-                return "video"
-            return "document"
-        return "document"
-
-# Initialize Telethon Manager
-telethon_mgr = TelethonManager()
-
-# -----------------------
-# TELEGRAM BOT HANDLERS
-# -----------------------
-updater = Updater(BOT_TOKEN, use_context=True)
-dp = updater.dispatcher
-
-def owner_only(func):
-    @wraps(func)
-    def wrapper(update: Update, context: CallbackContext, *args, **kwargs):
-        if update.effective_user.id != OWNER_ID:
-            update.message.reply_text("❌ Unauthorized access!")
-            return
-        return func(update, context, *args, **kwargs)
-    return wrapper
-
-@owner_only
-def start_command(update: Update, context: CallbackContext):
-    """Handle /start command"""
-    welcome_text = """
-🚀 **High Speed Media Download Bot**
-
-**Features:**
-• 📥 High speed downloads
-• 📤 Fast upload to Telegram  
-• 🗑️ Auto cleanup after upload
-• 💾 Support files up to 1GB
-• 📱 Phone login in bot
-
-**Commands:**
-/login - Login with phone number
-/status - Check bot status
-/help - Show this message
-
-**Ready to download media!**
-    """
-    update.message.reply_text(welcome_text, parse_mode='Markdown')
-
-@owner_only
-def status_command(update: Update, context: CallbackContext):
-    """Handle /status command"""
-    status_text = f"""
-🤖 **Bot Status**
-
-• 🔗 Telethon Connected: `{telethon_mgr.is_connected}`
-• 💾 Max File Size: `1 GB`
-• 🗑️ Auto Cleanup: `Enabled`
-• 🚀 Uptime: `Active`
-
-**Ready: {'✅' if telethon_mgr.is_connected else '❌'}**
-    """
-    update.message.reply_text(status_text, parse_mode='Markdown')
-
-@owner_only
-def login_command(update: Update, context: CallbackContext):
-    """Start phone login process"""
-    if telethon_mgr.is_connected:
-        update.message.reply_text("✅ Already logged in!")
-        return ConversationHandler.END
+        processing = True
+        message = video_queue.popleft()
         
-    update.message.reply_text(
-        "📱 Please send your phone number in international format:\n"
-        "Example: +1234567890"
+        try:
+            if not user_caption_template:
+                await message.reply_text("❌ **Please set caption template first using /set_caption**")
+                continue
+
+            filename = message.video.file_name if message.video and message.video.file_name else ""
+            extracted_episode, extracted_quality = extract_episode_and_quality(message.caption, filename)
+            
+            if extracted_episode is None or extracted_quality is None:
+                await message.reply_text(
+                    f"❌ Could not extract episode/quality from:\n\n"
+                    f"**Caption:** {message.caption or 'No caption'}\n\n"
+                    f"**Filename:** {filename or 'No filename'}\n\n"
+                    f"**Extracted:** Episode: {extracted_episode}, Quality: {extracted_quality}"
+                )
+                continue
+
+            final_caption = generate_final_caption(extracted_episode, extracted_quality)
+            
+            if final_caption:
+                try:
+                    await message.copy(chat_id=message.chat.id, caption=final_caption, parse_mode=ParseMode.MARKDOWN)
+                    logger.info(f"✅ Posted - Episode: {extracted_episode}, Quality: {extracted_quality}")
+                except Exception:
+                    await message.copy(chat_id=message.chat.id, caption=final_caption)
+                    logger.info(f"✅ Posted (no markdown) - Episode: {extracted_episode}, Quality: {extracted_quality}")
+                    
+        except Exception as e:
+            logger.error(f"Error processing video: {e}")
+            await message.reply_text(f"❌ Error processing video: {str(e)}")
+        
+        await asyncio.sleep(0.5)
+
+# ----------------- Bot Commands -----------------
+
+@app.on_message(filters.command("start"))
+async def start_command(client, message: Message):
+    global processor_started
+    if not processor_started:
+        asyncio.create_task(process_videos_serial())
+
+    await message.reply_text(
+        "🤖 **Advanced Caption Bot Started!**\n\n"
+        "**Usage:**\n"
+        "1. /set_caption - Set full template\n"
+        "2. Send videos\n"
+        "3. Get perfectly formatted captions\n\n"
+        "**Template must include:** {episode} and {quality}"
     )
-    return PHONE
 
-def phone_handler(update: Update, context: CallbackContext):
-    """Handle phone number input"""
-    phone_number = update.message.text.strip()
-    
-    async def send_code():
-        success, message = await telethon_mgr.connect_with_phone(phone_number)
-        if success:
-            update.message.reply_text(f"✅ Code sent! Please check Telegram and send the code:")
-            return CODE
-        else:
-            update.message.reply_text(f"❌ Failed: {message}")
-            return ConversationHandler.END
-    
-    # Run async function
-    result = asyncio.run_coroutine_threadsafe(send_code(), asyncio.get_event_loop())
-    next_state = result.result(timeout=30)
-    
-    return next_state
-
-def code_handler(update: Update, context: CallbackContext):
-    """Handle authentication code"""
-    code = update.message.text.strip()
-    
-    async def verify_code():
-        success, message = await telethon_mgr.verify_code(code)
-        if success:
-            update.message.reply_text("✅ Successfully logged in! You can now download media.")
-        else:
-            update.message.reply_text(f"❌ Login failed: {message}")
-        return ConversationHandler.END
-    
-    # Run async function
-    result = asyncio.run_coroutine_threadsafe(verify_code(), asyncio.get_event_loop())
-    result.result(timeout=30)
-    
-    return ConversationHandler.END
-
-def cancel_command(update: Update, context: CallbackContext):
-    """Cancel conversation"""
-    update.message.reply_text("❌ Login cancelled.")
-    return ConversationHandler.END
-
-async def upload_large_file(file_path, chat_id, caption, file_type, bot):
-    """Upload large files in chunks to avoid Render timeout"""
-    try:
-        file_size = os.path.getsize(file_path)
-        file_size_mb = file_size / (1024 * 1024)
-        
-        # For files larger than 50MB, use chunked upload
-        if file_size > 50 * 1024 * 1024:
-            await bot.send_message(chat_id, f"📦 Uploading large file: {file_size_mb:.2f} MB (this may take a while...)")
-        
-        with open(file_path, 'rb') as file:
-            if file_type == "photo":
-                await bot.send_photo(
-                    chat_id=chat_id,
-                    photo=file,
-                    caption=caption,
-                    timeout=300
-                )
-            elif file_type == "video":
-                await bot.send_video(
-                    chat_id=chat_id,
-                    video=file,
-                    caption=caption,
-                    supports_streaming=True,
-                    timeout=300
-                )
-            else:
-                await bot.send_document(
-                    chat_id=chat_id,
-                    document=file,
-                    caption=caption,
-                    timeout=300
-                )
-        
-        return True, "Upload successful"
-    except Exception as e:
-        logger.error(f"Upload error: {e}")
-        return False, str(e)
-
-async def process_media_download(chat_identifier, message_id, update: Update):
-    """Process media download and upload with progress updates"""
-    try:
-        if not telethon_mgr.is_connected:
-            return "❌ Not logged in. Use /login first"
-        
-        # Send initial status
-        status_msg = await update.message.reply_text("⚡ Starting download...")
-        
-        # Download media
-        download_result = await telethon_mgr.download_media(chat_identifier, message_id)
-        
-        if not download_result["success"]:
-            await status_msg.edit_text(f"❌ Download failed: {download_result['error']}")
+@app.on_message(filters.command("set_caption"))
+async def set_caption_command(client, message: Message):
+    global user_caption_template
+    if len(message.command) > 1:
+        template_text = " ".join(message.command[1:])
+        if "{episode}" not in template_text or "{quality}" not in template_text:
+            await message.reply_text("❌ Template must include {episode} and {quality}")
             return
-        
-        file_path = download_result["file_path"]
-        file_size_mb = download_result["file_size"] / (1024 * 1024)
-        media_type = download_result["file_type"]
-        caption = download_result["caption"][:1024] if download_result["caption"] else ""
-        
-        # Update status
-        await status_msg.edit_text(f"✅ Downloaded: {file_size_mb:.2f} MB\n⚡ Uploading now...")
-        
-        # Upload file
-        success, upload_message = await upload_large_file(
-            file_path, 
-            update.effective_chat.id, 
-            caption, 
-            media_type, 
-            update.bot
-        )
-        
-        # Cleanup file
-        if os.path.exists(file_path):
-            os.unlink(file_path)
-            logger.info(f"Cleaned up file: {file_path}")
-        
-        if success:
-            await status_msg.edit_text(f"🎉 Success! Processed {file_size_mb:.2f} MB file")
-        else:
-            await status_msg.edit_text(f"❌ Upload failed: {upload_message}")
-            
-    except Exception as e:
-        logger.error(f"Processing error: {e}")
-        # Cleanup on error
-        if 'file_path' in locals() and os.path.exists(file_path):
-            os.unlink(file_path)
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-
-@owner_only
-def handle_message(update: Update, context: CallbackContext):
-    """Handle incoming messages with Telegram links"""
-    text = update.message.text.strip()
-    
-    # Extract link using regex
-    link_pattern = r'(?:https?://)?t\.me/([^/]+)/(\d+)'
-    matches = re.findall(link_pattern, text)
-    
-    if not matches:
-        update.message.reply_text("❌ Please send a valid Telegram message link")
-        return
-    
-    # Process first link found
-    chat_identifier, message_id = matches[0]
-    message_id = int(message_id)
-    
-    # Run async processing
-    async def run_processing():
-        await process_media_download(chat_identifier, message_id, update)
-    
-    asyncio.run_coroutine_threadsafe(run_processing(), asyncio.get_event_loop())
-
-# Register handlers
-conv_handler = ConversationHandler(
-    entry_points=[CommandHandler('login', login_command)],
-    states={
-        PHONE: [MessageHandler(Filters.text & ~Filters.command, phone_handler)],
-        CODE: [MessageHandler(Filters.text & ~Filters.command, code_handler)],
-    },
-    fallbacks=[CommandHandler('cancel', cancel_command)]
-)
-
-dp.add_handler(conv_handler)
-dp.add_handler(CommandHandler("start", start_command))
-dp.add_handler(CommandHandler("status", status_command))
-dp.add_handler(CommandHandler("help", start_command))
-dp.add_handler(CommandHandler("cancel", cancel_command))
-dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
-
-# -----------------------
-# STARTUP & BACKGROUND TASKS
-# -----------------------
-def start_services():
-    """Start all services"""
-    # Start Telegram Bot polling
-    updater.start_polling()
-    logger.info("✅ Telegram Bot started polling")
-    
-    # Initialize Telethon client
-    if telethon_mgr.initialize_client():
-        logger.info("✅ Telethon client initialized")
+        user_caption_template = fix_template_formatting(template_text)
+        test_output = generate_final_caption(1, "480p")
+        await message.reply_text(f"✅ Template Set!\nPreview:\n\n{test_output}\n")
     else:
-        logger.error("❌ Failed to initialize Telethon client")
+        await message.reply_text("Send full template after /set_caption command.")
 
-def stop_services():
-    """Stop all services gracefully"""
-    logger.info("🛑 Stopping services...")
-    updater.stop()
-    if telethon_mgr.client:
-        telethon_mgr.client.disconnect()
-    logger.info("✅ All services stopped")
+@app.on_message(filters.text & filters.private & ~filters.command(["start", "set_caption", "status", "clear_queue", "test", "template"]))
+async def handle_caption_template(client, message: Message):
+    global user_caption_template
+    if not message.text.startswith('/'):
+        template_text = message.text
+        if "{episode}" not in template_text or "{quality}" not in template_text:
+            await message.reply_text("❌ Template must include {episode} and {quality}")
+            return
+        user_caption_template = fix_template_formatting(template_text)
+        test_output = generate_final_caption(1, "480p")
+        await message.reply_text(f"✅ Template Set!\nPreview:\n\n{test_output}\n")
 
-# -----------------------
-# MAIN EXECUTION
-# -----------------------
+@app.on_message(filters.video)
+async def handle_video_message(client, message: Message):
+    if not user_caption_template:
+        await message.reply_text("❌ Set caption template first using /set_caption")
+        return
+    video_queue.append(message)
+    if not processor_started:
+        asyncio.create_task(process_videos_serial())
+
+@app.on_message(filters.command("status"))
+async def status_command(client, message: Message):
+    queue_size = len(video_queue)
+    status_text = f"📊 Bot Status:\n• Queue size: {queue_size}\n• Template set: {'✅' if user_caption_template else '❌'}\n• Processor: {'✅ Running' if processor_started else '❌ Stopped'}"
+    if user_caption_template:
+        test_output = generate_final_caption(1, "480p")
+        status_text += f"\n\nTemplate Preview:\n\n{test_output}\n"
+    await message.reply_text(status_text)
+
+@app.on_message(filters.command("clear_queue"))
+async def clear_queue_command(client, message: Message):
+    video_queue.clear()
+    await message.reply_text("✅ Queue cleared!")
+
+@app.on_message(filters.command("test"))
+async def test_command(client, message: Message):
+    if user_caption_template:
+        test_output = generate_final_caption(1, "480p")
+        await message.reply_text(f"Template Test:\n\n{test_output}\n")
+    else:
+        await message.reply_text("❌ No template set.")
+
+@app.on_message(filters.command("template"))
+async def template_command(client, message: Message):
+    if user_caption_template:
+        await message.reply_text(f"Current Template:\n\n{user_caption_template}\n")
+    else:
+        await message.reply_text("❌ No template set.")
+
+# ----------------- Main -----------------
+
 if __name__ == "__main__":
-    try:
-        # Start Flask app in background thread for Render
-        def run_flask():
-            app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
-        
-        flask_thread = threading.Thread(target=run_flask, daemon=True)
-        flask_thread.start()
-        
-        # Start bot services
-        start_services()
-        
-        logger.info("🚀 Bot is now fully operational!")
-        logger.info("🌐 Flask server running on port 5000 for Uptime Robot")
-        
-        # Keep the bot running
-        updater.idle()
-            
-    except KeyboardInterrupt:
-        logger.info("Received interrupt signal...")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-    finally:
-        stop_services()
+    print("🎯 Advanced Caption Bot Started...")
+    asyncio.get_event_loop().create_task(process_videos_serial())
+    app.run()
