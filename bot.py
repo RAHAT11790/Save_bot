@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 # ----------------- Environment Variables -----------------
 API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")  # ✅ Correct variable name here!
 
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise ValueError("⚠️ Missing API credentials! Set API_ID, API_HASH, and BOT_TOKEN.")
